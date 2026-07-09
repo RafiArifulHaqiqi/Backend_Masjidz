@@ -1,195 +1,215 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, UploadFile, File
 from datetime import datetime
 from pydantic import BaseModel
 import requests
 import base64
+import firebase_admin
+from firebase_admin import credentials, firestore
+import io
+from PIL import Image
+import pytesseract
+import sys
+from bs4 import BeautifulSoup
+import re
+from collections import Counter
+import random
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ==============================================================================
-# 1. DEFINISI PYDANTIC MODEL (Untuk Validasi Request Body Donasi)
+# INITIALIZATION
 # ==============================================================================
+if not firebase_admin._apps:
+    cred = credentials.Certificate("serviceAccountKey.json")
+    firebase_admin.initialize_app(cred)
+
+db = firestore.client()
+router = APIRouter()
+
 class DonasiRequest(BaseModel):
     amount: int
     user_id: str
 
 # ==============================================================================
-# HUBUNGKAN DENGAN FIREBASE ADMIN SDK KAMU
-# ==============================================================================
-# Pastikan inisialisasi Firebase Admin SDK sudah benar di project-mu.
-# Jika kamu menginisialisasi db di file lain (misal config.py), silakan import:
-# from config import db
-#
-# Jika belum ada, ini template standar inisialisasi Firestore:
-import firebase_admin
-from firebase_admin import credentials, firestore
-
-if not firebase_admin._apps:
-    cred = credentials.Certificate("serviceAccountKey.json") # Ganti dengan nama file key-mu
-    firebase_admin.initialize_app(cred)
-
-db = firestore.client()
+# ENDPOINTS UTAMA (LOG, SINKRONISASI & DONASI)
 # ==============================================================================
 
-router = APIRouter()
-
-# --- 1. ENDPOINT SINKRONISASI AKUN BARU ---
 @router.post("/sync-google")
 async def sync_google(data: dict):
-    """
-    Endpoint yang dipanggil oleh Flutter setelah user berhasil memverifikasi OTP
-    dan terdaftar di Firebase Auth. Berfungsi mencatat log pendaftaran awal.
-    """
-    try:
-        name = data.get("name")
-        email = data.get("email")
+    name = data.get("name")
+    email = data.get("email")
+    activity_type = data.get("activity", "Registrasi Akun Baru Berhasil")
 
-        if not email:
-            return {"status": "error", "message": "Email tidak boleh kosong"}
+    if not email:
+        return {"status": "error", "message": "Email tidak boleh kosong"}
 
-        # Catat Log Aktivitas Registrasi Berhasil ke koleksi 'logs'
-        log_data = {
-            "email": email,
-            "activity": "Registrasi Akun Baru Berhasil",
-            "timestamp": datetime.now(), 
-            "details": f"User {name if name else 'Tanpa Nama'} telah menyelesaikan registrasi via aplikasi."
-        }
-        db.collection('logs').add(log_data)
+    log_data = {
+        "email": email,
+        "activity": activity_type,  
+        "timestamp": datetime.now(),
+        "details": f"User {name if name else 'Tanpa Nama'} melakukan: {activity_type}"
+    }
+    db.collection('logs').add(log_data)
+    return {"status": "success"}
 
-        print(f"✅ LOG BACKEND: {email} berhasil disinkronkan.")
-        return {"status": "success", "message": "Activity logged successfully"}
-        
-    except Exception as e:
-        print(f"❌ ERROR SYNC: {str(e)}")
-        return {"status": "error", "message": str(e)}
-
-
-# --- 2. ENDPOINT PENCATATAN AKTIVITAS UMUM (Login, Reset Password, dll) ---
 @router.post("/log-activity")
 async def log_activity(data: dict):
-    """
-    Endpoint fleksibel untuk mencatat segala bentuk tindakan user dari Flutter,
-    seperti 'Login Berhasil' or 'Reset Password Berhasil'.
-    """
-    try:
-        email = data.get("email")
-        action = data.get("action") 
+    email = data.get("email")
+    action = data.get("action") 
+    if not email or not action:
+        return {"status": "error", "message": "Email dan action harus diisi"}
 
-        if not email or not action:
-            return {"status": "error", "message": "Email dan action harus diisi"}
+    db.collection('logs').add({
+        "email": email,
+        "activity": action,
+        "timestamp": datetime.now(),
+        "details": f"User {email} melakukan tindakan: {action}"
+    })
+    return {"status": "success"}
 
-        log_data = {
-            "email": email,
-            "activity": action,
-            "timestamp": datetime.now(),
-            "details": f"User {email} melakukan tindakan: {action}"
-        }
-        db.collection('logs').add(log_data)
-        
-        print(f"✅ LOG BACKEND: Aktivitas '{action}' dari {email} berhasil dicatat.")
-        return {"status": "success"}
-        
-    except Exception as e:
-        print(f"❌ ERROR LOG: {str(e)}")
-        return {"status": "error", "message": str(e)}
-
-
-# --- 3. ENDPOINT AMBIL DATA LOGS (Untuk Ditampilkan di Web Dashboard) ---
 @router.get("/logs")
 async def get_logs():
-    """
-    Mengambil 10 riwayat aktivitas terbaru dari Firestore 
-    untuk ditampilkan pada halaman dashboard web admin.
-    """
-    try:
-        docs = db.collection('logs').order_by("timestamp", direction="DESCENDING").limit(10).stream()
-        
-        log_list = []
-        for doc in docs:
-            d = doc.to_dict()
-            # Konversi objek datetime Python ke string ISO agar tidak error saat dikirim lewat JSON
-            if "timestamp" in d and d["timestamp"]:
-                d["timestamp"] = d["timestamp"].isoformat()
-            log_list.append(d)
-            
-        return log_list
-        
-    except Exception as e:
-        print(f"❌ ERROR GET LOGS: {str(e)}")
-        return {"status": "error", "message": str(e)} 
+    docs = db.collection('logs').order_by("timestamp", direction="DESCENDING").limit(10).stream()
+    log_list = []
+    for doc in docs:
+        d = doc.to_dict()
+        if "timestamp" in d and d["timestamp"]:
+            d["timestamp"] = d["timestamp"].isoformat()
+        log_list.append(d)
+    return log_list
 
-
-# --- 4. ENDPOINT BARU: MEMBUAT TRANSAKSI DONASI MIDTRANS SNAP ---
 @router.post("/donasi")
 async def create_donation(request: DonasiRequest):
-    """
-    Endpoint baru untuk memproses request donasi dari aplikasi Flutter,
-    menghubungkannya ke API Midtrans Sandbox, dan menghasilkan Token/Redirect URL Pembayaran.
-    """
     try:
-        # PENTING: Ganti dengan Server Key milik akun Midtrans Sandbox kamu sendiri
-        MIDTRANS_SERVER_KEY = "MIDTRANS_SERVER_KEY"
-        
-        print(f"DEBUG DONASI: Rp{request.amount} dari User ID: {request.user_id}")
+        MIDTRANS_SERVER_KEY = "TOKEN_DISEMBUNYIKAN"
+        clean_user_id = request.user_id.split('@')[0]
+        order_id = f"DONASI-{clean_user_id}-{int(datetime.now().timestamp() * 1000)}"
 
-        # Membuat Order ID unik berbasis waktu supaya tidak bentrok di Midtrans
-        order_id = f"DONASI-{request.user_id}-{int(datetime.now().timestamp())}"
-
-        # Setup parameter standar transaksi Snap Midtrans
         payload = {
-            "transaction_details": {
-                "order_id": order_id,
-                "gross_amount": request.amount
-            },
-            "credit_card": {
-                "secure": True
-            }
+            "transaction_details": {"order_id": order_id, "gross_amount": request.amount},
+            "credit_card": {"secure": True}
         }
 
-        # Melakukan Encode Server Key untuk otentikasi Basic Auth API Midtrans
         auth_string = base64.b64encode(f"{MIDTRANS_SERVER_KEY}:".encode()).decode()
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Basic {auth_string}"
-        }
-
-        # Menembak server API Midtrans Sandbox
         response = requests.post(
             "https://app.sandbox.midtrans.com/snap/v1/transactions",
             json=payload,
-            headers=headers
+            headers={"Accept": "application/json", "Content-Type": "application/json", "Authorization": f"Basic {auth_string}"}
         )
 
         midtrans_data = response.json()
 
         if response.status_code == 201:
-            # Simpan log inisiasi pembayaran sukses ke database lokal 'donations'
             db.collection('donations').document(order_id).set({
-                "user_id": request.user_id,
-                "amount": request.amount,
-                "status": "pending",
-                "snap_token": midtrans_data.get("token"),
-                "redirect_url": midtrans_data.get("redirect_url"),
-                "timestamp": datetime.now()
+                "user_id": request.user_id, "amount": request.amount, "status": "pending",
+                "snap_token": midtrans_data.get("token"), "redirect_url": midtrans_data.get("redirect_url"), "timestamp": datetime.now()
             })
-
-            # Ikut catat ke dalam log aktivitas admin
             db.collection('logs').add({
-                "email": request.user_id,
-                "activity": f"Inisiasi Donasi Rp{request.amount}",
-                "timestamp": datetime.now(),
-                "details": f"Membuat transaksi donasi baru dengan ID: {order_id}"
+                "email": request.user_id, "activity": f"Inisiasi Donasi Rp{request.amount}",
+                "timestamp": datetime.now(), "details": f"Donasi baru ID: {order_id}"
             })
-
-            print(f"✅ MIDTRANS SUCCESS: Token berhasil dibuat untuk {order_id}")
-            return {
-                "status": "success", 
-                "token": midtrans_data.get("token"), 
-                "redirect_url": midtrans_data.get("redirect_url")
-            }
+            return {"status": "success", "token": midtrans_data.get("token"), "redirect_url": midtrans_data.get("redirect_url")}
         else:
-            print(f"❌ MIDTRANS ERROR RESP: {midtrans_data}")
-            return {"status": "error", "message": midtrans_data.get("error_messages", ["Gagal terhubung ke Midtrans"])}
-
+            return {"status": "error", "message": midtrans_data.get("error_messages")}
     except Exception as e:
-        print(f"❌ ERROR SERVER DONASI: {str(e)}")
         return {"status": "error", "message": str(e)}
+
+# ==============================================================================
+# ENDPOINT OCR (SCAN GAMBAR / STRUK)
+# ==============================================================================
+
+@router.post("/scan-struk")
+async def scan_struk(file: UploadFile = File(...)):
+    try:
+        if sys.platform.startswith('win'):
+            pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents))
+        extracted_text = pytesseract.image_to_string(image)
+
+        return {"status": "success", "filename": file.filename, "extracted_text": extracted_text.strip()}
+    except Exception as e:
+        return {"status": "error", "message": f"Gagal memproses gambar: {str(e)}"}
+
+# ==============================================================================
+# FITUR BERITA KAJIAN POPULER (AUTOMATED CRON JOB JAM 00:00 WIB)
+# ==============================================================================
+
+# 1. Fungsi Utama Pencari & Penganalisis Berita
+def run_auto_scraping():
+    try:
+        url = "https://www.republika.co.id/rss/dunia-islam"
+        response = requests.get(url)
+        soup = BeautifulSoup(response.content, features="xml")
+        
+        items = soup.findAll('item')
+        berita_list = []
+        all_text_for_analysis = ""
+        
+        for item in items[:15]: 
+            title = item.title.text
+            link = item.link.text
+            pubDate = item.pubDate.text
+            description = item.description.text
+            
+            clean_desc = re.sub('<[^<]+>', '', description)
+            clean_title = re.sub(r'[^\w\s]', '', title).lower()
+            
+            all_text_for_analysis += clean_title + " "
+            
+            berita_list.append({
+                "title": title,
+                "link": link,
+                "date": pubDate,
+                "description": clean_desc.strip(),
+                "views": random.randint(50, 1000) 
+            })
+            
+        words = all_text_for_analysis.split()
+        stop_words = ['dan', 'di', 'yang', 'ke', 'dari', 'ini', 'untuk', 'pada', 'dengan', 'dalam', 'tentang']
+        filtered_words = [w for w in words if w not in stop_words and len(w) > 3]
+        word_counts = Counter(filtered_words)
+        
+        trending_keywords = [word[0] for word in word_counts.most_common(3)]
+        
+        old_docs = db.collection('berita').stream()
+        for doc in old_docs:
+            doc.reference.delete()
+            
+        for b in berita_list:
+            b['trending_tags'] = trending_keywords 
+            db.collection('berita').add(b)
+            
+        print(f"[{datetime.now()}] CRAWLING OTOMATIS BERHASIL. Trending Hari Ini: {trending_keywords}")
+        return {"status": "success", "trending_topics": trending_keywords}
+    except Exception as e:
+        print(f"[{datetime.now()}] ERROR CRAWLING: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+
+# 2. Pengaturan Jadwal Otomatis (Cron Job)
+scheduler = AsyncIOScheduler()
+
+@router.on_event("startup")
+async def start_scheduler():
+    # Menjalankan scraping 1x di awal saat server baru dinyalakan (untuk memastikan data ada)
+    run_auto_scraping()
+    
+    # Menjadwalkan otomatis menggunakan metode 'cron' agar berjalan TEPAT pukul 00:00 WIB setiap hari
+    scheduler.add_job(
+        run_auto_scraping, 
+        'cron', 
+        hour=0, 
+        minute=0, 
+        timezone='Asia/Jakarta' # Asia/Jakarta otomatis menggunakan patokan Waktu Indonesia Barat (WIB)
+    )
+    
+    if not scheduler.running:
+        scheduler.start()
+
+
+# 3. Endpoint Get Berita untuk Flutter
+@router.get("/berita-populer")
+async def get_berita_populer():
+    docs = db.collection('berita').order_by("views", direction="DESCENDING").stream()
+    return [doc.to_dict() for doc in docs]

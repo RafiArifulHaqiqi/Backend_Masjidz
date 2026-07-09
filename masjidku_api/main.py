@@ -4,9 +4,8 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# Import file yang kita buat tadi
-import routes_api
-import routes_dashboard
+from masjidku_api import routes_api
+from masjidku_api import routes_dashboard  # (Jika ada)
 
 app = FastAPI(title="Masjidku Pro Modular Backend")
 

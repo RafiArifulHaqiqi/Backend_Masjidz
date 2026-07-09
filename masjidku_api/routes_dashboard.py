@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from firebase_config import db
+from masjidku_api.firebase_config import db
 from datetime import datetime
 import bcrypt
 
@@ -11,7 +11,6 @@ router = APIRouter(tags=["Admin Monitoring"])
 # ==========================================
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: str = None):
-    # Memunculkan alert merah jika ada error
     error_msg = f'<div class="alert alert-danger">{error}</div>' if error else ""
     
     return f"""
@@ -44,7 +43,6 @@ async def login_admin(
     password: str = Form(...)
 ):
     try:
-        # Cari user di Firestore berdasarkan email
         user_ref = db.collection("users").where("email", "==", email).limit(1).stream()
         user_data = None
         for doc in user_ref:
@@ -53,10 +51,8 @@ async def login_admin(
         if not user_data:
             return RedirectResponse(url="/login?error=Email tidak terdaftar!", status_code=303)
 
-        # Ambil password hash dari database
         hashed_password_db = user_data.get("password", "")
 
-        # Bandingkan input password dengan password hash di database
         if bcrypt.checkpw(password.encode('utf-8'), hashed_password_db.encode('utf-8')):
             if user_data.get("role") == "admin":
                 return RedirectResponse(url="/dashboard", status_code=303)
@@ -73,24 +69,17 @@ async def login_admin(
 # ==========================================
 @router.get("/dashboard", response_class=HTMLResponse)
 async def get_dashboard():
-    # 1. Ambil Data Users
     users = [doc.to_dict() for doc in db.collection('users').stream()]
-    
-    # 2. Ambil log terbaru (limit 10)
     logs = [doc.to_dict() for doc in db.collection('logs').order_by("timestamp", direction="DESCENDING").limit(10).stream()]
     
-    # 3. --- TAMBAHAN: Ambil data Donasi ---
-    # PERBAIKAN: Mengubah nama koleksi menjadi 'donations' sesuai dengan API Midtrans
     donasi_stream = db.collection('donations').order_by("timestamp", direction="DESCENDING").stream()
     
     donasi_list = []
     for doc in donasi_stream:
         d_dict = doc.to_dict()
-        # PERBAIKAN: Mengambil ID dokumen sebagai order_id agar tampil di web
         d_dict['order_id'] = doc.id 
         donasi_list.append(d_dict)
         
-    # Hitung total uang donasi terkumpul
     total_terkumpul = sum([int(d.get("amount", 0)) for d in donasi_list])
     
     html_content = f"""
@@ -102,7 +91,6 @@ async def get_dashboard():
             body {{ background: #f4f7f6; font-family: sans-serif; }}
             .nav-m {{ background: #064635; color: white; }}
             .card {{ border:none; border-radius:15px; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }}
-            /* Sedikit mengurangi tinggi log agar pas dengan tambahan tabel donasi */
             .log-container {{ height: 200px; overflow-y: auto; background: #212529; color: #00ff00; padding: 15px; border-radius: 10px; font-family: monospace; font-size: 13px; }}
             .log-item {{ border-bottom: 1px solid #333; padding: 5px 0; }}
         </style>
@@ -118,10 +106,26 @@ async def get_dashboard():
                             <input type="text" name="date" class="form-control mb-2" placeholder="Tanggal (e.g. 26 Juni)" required>
                             <input type="text" name="khatib" class="form-control mb-2" placeholder="Nama Khatib" required>
                             <input type="text" name="jabatan" class="form-control mb-2" placeholder="Gelar/Jabatan">
-                            <input type="text" name="avatarUrl" class="form-control mb-3" placeholder="Link Foto Profil (URL)">
                             <button type="submit" class="btn btn-success btn-sm w-100">Update Petugas</button>
                         </form>
                     </div>
+                    
+                    <div class="card p-4 mb-3">
+                        <h6 class="text-danger">Input Laporan Pengeluaran</h6>
+                        
+                        <div class="mb-3 p-2 border rounded bg-light">
+                            <label class="form-label text-dark fw-bold" style="font-size: 12px;">📷 Scan Struk via Kamera HP</label>
+                            <input type="file" id="cameraInput" accept="image/*" capture="environment" class="form-control form-control-sm">
+                            <div id="ocrLoading" class="text-secondary mt-1" style="display:none; font-size:12px;">Menghubungi server OCR...</div>
+                        </div>
+
+                        <form action="/add-report" method="post">
+                            <input type="text" id="reportJudul" name="judul" class="form-control mb-2" placeholder="Nama Pengeluaran" required>
+                            <input type="number" id="reportNominal" name="nominal" class="form-control mb-2" placeholder="Nominal (Rp)" required>
+                            <button type="submit" class="btn btn-danger btn-sm w-100">Tambah Laporan</button>
+                        </form>
+                    </div>
+                    
                     <div class="card p-4">
                         <h6 class="text-primary">Tambah Kegiatan</h6>
                         <form action="/add-activity" method="post">
@@ -182,6 +186,54 @@ async def get_dashboard():
                 </div>
             </div>
         </div>
+
+        <script>
+            document.getElementById('cameraInput').addEventListener('change', async function(e) {{
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const formData = new FormData();
+                formData.append('file', file);
+
+                const loading = document.getElementById('ocrLoading');
+                loading.style.display = 'block';
+                loading.className = 'text-warning mt-1';
+                loading.innerText = 'Sedang memproses gambar struk...';
+
+                try {{
+                    const response = await fetch('/api/scan-struk', {{
+                        method: 'POST',
+                        body: formData
+                    }});
+                    const result = await response.json();
+                    
+                    if (result.status === 'success') {{
+                        loading.className = 'text-success mt-1';
+                        loading.innerText = 'Scan berhasil!';
+                        
+                        if (result.extracted_text) {{
+                            // Potong teks hasil scan untuk judul
+                            document.getElementById('reportJudul').value = result.extracted_text.substring(0, 30).replace(/\\n/g, ' ');
+                            
+                            // Ambil nominal angka terbesar di dalam struk menggunakan pencocokan regex
+                            const numbers = result.extracted_text.match(/\\d+[\\d.,]*/g);
+                            if (numbers) {{
+                                const cleanNumbers = numbers.map(n => parseInt(n.replace(/[\\.,]/g, ''))).filter(n => n > 1000 && n < 10000000);
+                                if (cleanNumbers.length > 0) {{
+                                    document.getElementById('reportNominal').value = Math.max(...cleanNumbers);
+                                }}
+                            }}
+                        }}
+                    }} else {{
+                        loading.className = 'text-danger mt-1';
+                        loading.innerText = 'Gagal: ' + result.message;
+                    }}
+                }} catch (err) {{
+                    loading.className = 'text-danger mt-1';
+                    loading.innerText = 'Gagal terhubung ke server OCR.';
+                }}
+            }});
+        </script>
     </body>
     </html>
     """
@@ -201,4 +253,18 @@ async def add_announcement(date: str = Form(...), khatib: str = Form(...), jabat
 @router.post("/add-activity")
 async def add_activity(title: str = Form(...), time: str = Form(...), description: str = Form(""), imageUrl: str = Form(...)):
     db.collection('activities').add({"title": title, "time": time, "description": description, "imageUrl": imageUrl})
+    return RedirectResponse(url="/dashboard", status_code=303)
+
+@router.post("/add-report")
+async def add_report(judul: str = Form(...), nominal: int = Form(...)):
+    db.collection('reports').add({
+        "judul": judul,
+        "nominal": nominal,
+        "timestamp": datetime.now()
+    })
+    db.collection('logs').add({
+        "email": "Admin Web",
+        "activity": f"Laporan Pengeluaran: {judul} (Rp {nominal:,})",
+        "timestamp": datetime.now()
+    })
     return RedirectResponse(url="/dashboard", status_code=303)
