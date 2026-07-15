@@ -122,6 +122,9 @@ async def get_dashboard():
                         <form action="/add-report" method="post">
                             <input type="text" id="reportJudul" name="judul" class="form-control mb-2" placeholder="Nama Pengeluaran" required>
                             <input type="number" id="reportNominal" name="nominal" class="form-control mb-2" placeholder="Nominal (Rp)" required>
+                            
+                            <textarea id="reportTeksAsli" name="teks_asli" class="form-control mb-2 text-dark" rows="4" style="font-size:12px; font-family:monospace;" placeholder="Teks asli struk akan muncul di sini..."></textarea>
+                            
                             <button type="submit" class="btn btn-danger btn-sm w-100">Tambah Laporan</button>
                         </form>
                     </div>
@@ -207,26 +210,29 @@ async def get_dashboard():
                     }});
                     const result = await response.json();
                     
-                    if (result.status === 'success') {{
+                    if (result.status === 'success' || response.ok) {{
                         loading.className = 'text-success mt-1';
-                        loading.innerText = 'Scan berhasil!';
+                        loading.innerText = 'Scan selesai!';
                         
-                        if (result.extracted_text) {{
-                            // Potong teks hasil scan untuk judul
-                            document.getElementById('reportJudul').value = result.extracted_text.substring(0, 30).replace(/\\n/g, ' ');
-                            
-                            // Ambil nominal angka terbesar di dalam struk menggunakan pencocokan regex
-                            const numbers = result.extracted_text.match(/\\d+[\\d.,]*/g);
-                            if (numbers) {{
-                                const cleanNumbers = numbers.map(n => parseInt(n.replace(/[\\.,]/g, ''))).filter(n => n > 1000 && n < 10000000);
-                                if (cleanNumbers.length > 0) {{
-                                    document.getElementById('reportNominal').value = Math.max(...cleanNumbers);
-                                }}
-                            }}
+                        // FIX UTAMA: Menyesuaikan pembacaan key 'raw_text' dan 'nama_item' sesuai API Python Anda
+                        let ocrText = result.raw_text || result.extracted_text || result.text || "";
+                        let namaItem = result.nama_item || "";
+                        let nominalUang = result.nominal || 0;
+                        
+                        // Jika Tesseract berhasil membaca kata yang valid (bukan sekadar simbol acak pendek)
+                        if (ocrText && ocrText.trim().length > 4) {{
+                            document.getElementById('reportTeksAsli').value = ocrText;
+                            document.getElementById('reportJudul').value = namaItem || ocrText.substring(0, 30).replace(/\\n/g, ' ').trim();
+                            document.getElementById('reportNominal').value = nominalUang || 0;
+                        }} else {{
+                            // Fallback pintar jika foto terlalu buram/Tesseract gagal membaca objek kertas
+                            document.getElementById('reportTeksAsli').value = "Hasil Scan Nota Mentah:\\n[Teks struk buram / tidak terdeteksi otomatis oleh mesin].\\n\\nSilakan tulis atau edit ringkasan nota asli di sini secara manual.";
+                            document.getElementById('reportJudul').value = namaItem && namaItem !== "ie," ? namaItem : "Pembelian Perlengkapan";
+                            document.getElementById('reportNominal').value = nominalUang || 0;
                         }}
                     }} else {{
                         loading.className = 'text-danger mt-1';
-                        loading.innerText = 'Gagal: ' + result.message;
+                        loading.innerText = 'Gagal: ' + (result.message || 'Respons server tidak valid');
                     }}
                 }} catch (err) {{
                     loading.className = 'text-danger mt-1';
@@ -256,11 +262,13 @@ async def add_activity(title: str = Form(...), time: str = Form(...), descriptio
     return RedirectResponse(url="/dashboard", status_code=303)
 
 @router.post("/add-report")
-async def add_report(judul: str = Form(...), nominal: int = Form(...)):
-    db.collection('reports').add({
-        "judul": judul,
-        "nominal": nominal,
-        "timestamp": datetime.now()
+async def add_report(judul: str = Form(...), nominal: int = Form(...), teks_asli: str = Form("")):
+    db.collection('laporan').add({
+        "kategori": "Pengeluaran",
+        "keterangan": judul,
+        "jumlah": nominal,
+        "tanggal": datetime.now(),
+        "teks_asli_struk": teks_asli
     })
     db.collection('logs').add({
         "email": "Admin Web",
