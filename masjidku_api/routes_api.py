@@ -24,30 +24,38 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ==============================================================================
-# INITIALIZATION (Keamanan Firebase)
+# INITIALIZATION (Mengambil data dari Railway Variables)
 # ==============================================================================
-# Mengambil data JSON dari Environment Variable Railway (Lebih Aman)
+# 1. Firebase Configuration
 firebase_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
 
 if firebase_env:
-    # Jika berjalan di Railway, ubah string JSON menjadi dictionary
     cred_dict = json.loads(firebase_env)
     cred = credentials.Certificate(cred_dict)
 else:
-    # Fallback: Jika berjalan di lokal, gunakan file fisik
+    # Fallback untuk pengembangan lokal
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     cert_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
     cred = credentials.Certificate(cert_path)
 
-# Inisialisasi app hanya jika belum ada
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
 router = APIRouter()
 
+# 2. Midtrans Configuration
+MIDTRANS_SERVER_KEY = os.getenv("MIDTRANS_SERVER_KEY")
+MIDTRANS_CLIENT_KEY = os.getenv("MIDTRANS_CLIENT_KEY")
+
+core = midtransclient.CoreApi(
+    is_production=False,
+    server_key=MIDTRANS_SERVER_KEY, 
+    client_key=MIDTRANS_CLIENT_KEY
+)
+
 # ==============================================================================
-# MODELS & MIDDLEWARE
+# MODELS
 # ==============================================================================
 class DonasiRequest(BaseModel):
     amount: int
@@ -56,13 +64,6 @@ class DonasiRequest(BaseModel):
 class LaporanRequest(BaseModel):
     keterangan: str
     jumlah: int
-
-# Inisialisasi Midtrans
-core = midtransclient.CoreApi(
-    is_production=False,
-    server_key='MIDTRANS_SERVER_KEY', 
-    client_key='MIDTRANS_CLIENT_KEY'
-)
 
 # ==============================================================================
 # BACKGROUND TASKS
@@ -102,7 +103,8 @@ async def sync_google(data: dict):
 @router.post("/donasi")
 async def create_donation(request: DonasiRequest):
     try:
-        MIDTRANS_SERVER_KEY = "MIDTRANS_SERVER_KEY"
+        # Menggunakan server key dari variable lingkungan
+        server_key = os.getenv("MIDTRANS_SERVER_KEY")
         order_id = f"DONASI-{request.user_id.split('@')[0]}-{int(datetime.now().timestamp() * 1000)}"
         
         payload = {
@@ -110,7 +112,7 @@ async def create_donation(request: DonasiRequest):
             "credit_card": {"secure": True}
         }
         
-        auth_string = base64.b64encode(f"{MIDTRANS_SERVER_KEY}:".encode()).decode()
+        auth_string = base64.b64encode(f"{server_key}:".encode()).decode()
         response = requests.post(
             "https://app.sandbox.midtrans.com/snap/v1/transactions",
             json=payload,
@@ -131,7 +133,6 @@ async def create_donation(request: DonasiRequest):
 @router.post("/scan-struk")
 async def scan_struk(file: UploadFile = File(...)):
     try:
-        # Penanganan Tesseract di environment berbeda
         if sys.platform.startswith('linux'):
             pytesseract.pytesseract.tesseract_cmd = r'/usr/bin/tesseract'
         
@@ -163,16 +164,17 @@ async def run_auto_scraping():
         soup = BeautifulSoup(response.content, features="xml")
         
         items = soup.findAll('item')
-        old_docs = db.collection('berita').stream()
-        for doc in old_docs: doc.reference.delete()
-        
-        for item in items[:15]:
-            db.collection('berita').add({
-                "title": item.title.text,
-                "link": item.link.text,
-                "description": re.sub('<[^<]+>', '', item.description.text).strip(),
-                "views": random.randint(50, 1000)
-            })
+        if items:
+            old_docs = db.collection('berita').stream()
+            for doc in old_docs: doc.reference.delete()
+            
+            for item in items[:15]:
+                db.collection('berita').add({
+                    "title": item.title.text,
+                    "link": item.link.text,
+                    "description": re.sub('<[^<]+>', '', item.description.text).strip(),
+                    "views": random.randint(50, 1000)
+                })
     except Exception as e:
         print(f"Error scraping: {e}")
 
