@@ -85,8 +85,10 @@ def auto_check_status():
 Thread(target=auto_check_status, daemon=True).start()
 
 # ==============================================================================
-# ENDPOINTS
+# ENDPOINTS (Ditambah endpoint yang tadinya 404)
 # ==============================================================================
+
+# 1. Endpoint yang sudah ada
 @router.post("/sync-google")
 async def sync_google(data: dict):
     email = data.get("email")
@@ -99,6 +101,20 @@ async def sync_google(data: dict):
         "details": f"User {data.get('name')} melakukan sinkronisasi"
     })
     return {"status": "success"}
+
+# 2. Endpoint Tambahan (Agar tidak 404 lagi)
+@router.post("/log-activity")
+async def log_activity(data: dict):
+    # Menyimpan aktivitas ke log
+    db.collection('logs').add(data)
+    return {"status": "success"}
+
+@router.get("/berita-populer")
+async def get_berita_populer():
+    # Mengambil berita dari Firestore
+    berita = db.collection('berita').order_by("views", direction=firestore.Query.DESCENDING).limit(5).stream()
+    data = [doc.to_dict() for doc in berita]
+    return {"status": "success", "data": data}
 
 @router.post("/donasi")
 async def create_donation(request: DonasiRequest):
