@@ -24,16 +24,14 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ==============================================================================
-# INITIALIZATION (Mengambil data dari Railway Variables)
+# INITIALIZATION
 # ==============================================================================
-# 1. Firebase Configuration
 firebase_env = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON")
 
 if firebase_env:
     cred_dict = json.loads(firebase_env)
     cred = credentials.Certificate(cred_dict)
 else:
-    # Fallback untuk pengembangan lokal
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     cert_path = os.path.join(BASE_DIR, "serviceAccountKey.json")
     cred = credentials.Certificate(cert_path)
@@ -44,7 +42,7 @@ if not firebase_admin._apps:
 db = firestore.client()
 router = APIRouter()
 
-# 2. Midtrans Configuration
+# Midtrans Configuration
 MIDTRANS_SERVER_KEY = os.getenv("MIDTRANS_SERVER_KEY")
 MIDTRANS_CLIENT_KEY = os.getenv("MIDTRANS_CLIENT_KEY")
 
@@ -74,9 +72,12 @@ def auto_check_status():
             pending_donations = db.collection('donations').where('status', '==', 'pending').stream()
             for doc in pending_donations:
                 order_id = doc.id
-                status_response = core.transactions.status(order_id)
-                if status_response.get('transaction_status') in ['settlement', 'capture']:
-                    doc.reference.update({'status': 'success'})
+                try:
+                    status_response = core.transactions.status(order_id)
+                    if status_response.get('transaction_status') in ['settlement', 'capture']:
+                        doc.reference.update({'status': 'success'})
+                except:
+                    continue
         except Exception as e:
             print(f"Error auto_check: {e}")
         time.sleep(60)
@@ -86,7 +87,6 @@ Thread(target=auto_check_status, daemon=True).start()
 # ==============================================================================
 # ENDPOINTS
 # ==============================================================================
-
 @router.post("/sync-google")
 async def sync_google(data: dict):
     email = data.get("email")
@@ -103,7 +103,6 @@ async def sync_google(data: dict):
 @router.post("/donasi")
 async def create_donation(request: DonasiRequest):
     try:
-        # Menggunakan server key dari variable lingkungan
         server_key = os.getenv("MIDTRANS_SERVER_KEY")
         order_id = f"DONASI-{request.user_id.split('@')[0]}-{int(datetime.now().timestamp() * 1000)}"
         
@@ -161,22 +160,26 @@ async def run_auto_scraping():
     try:
         url = "https://www.republika.co.id/rss/khazanah"
         response = requests.get(url)
-        soup = BeautifulSoup(response.content, features="xml")
-        
-        items = soup.findAll('item')
-        if items:
-            old_docs = db.collection('berita').stream()
-            for doc in old_docs: doc.reference.delete()
-            
-            for item in items[:15]:
-                db.collection('berita').add({
-                    "title": item.title.text,
-                    "link": item.link.text,
-                    "description": re.sub('<[^<]+>', '', item.description.text).strip(),
-                    "views": random.randint(50, 1000)
-                })
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.content, features="xml")
+            items = soup.findAll('item')
+            if items:
+                old_docs = db.collection('berita').stream()
+                for doc in old_docs: doc.reference.delete()
+                for item in items[:15]:
+                    db.collection('berita').add({
+                        "title": item.title.text,
+                        "link": item.link.text,
+                        "description": re.sub('<[^<]+>', '', item.description.text).strip(),
+                        "views": random.randint(50, 1000)
+                    })
     except Exception as e:
         print(f"Error scraping: {e}")
+
+@router.get("/trigger-scraping")
+async def trigger_scraping():
+    await run_auto_scraping()
+    return {"status": "Scraping dipicu"}
 
 @router.on_event("startup")
 async def start_scheduler():
